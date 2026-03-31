@@ -742,14 +742,41 @@ void _startProvisioning() {
   ws.onEvent(onEvent);
   server.addHandler(&ws);
 
-  // ── Captive portal redirect for all unknown URLs ──
   server.onNotFound([](AsyncWebServerRequest* req) {
-    if (!_staReady)
-      req->redirect("http://192.168.4.1/");
-    else
-      req->send(404, "text/plain", "Not found");
-  });
 
+    String host = req->host();
+    String url  = req->url();
+
+    // ── Android / Google connectivity checks ──
+    if (host.indexOf("connectivitycheck.gstatic.com") >= 0 ||
+        host.indexOf("clients3.google.com") >= 0) {
+
+      // VERY IMPORTANT:
+      // Return 200 with content → triggers captive portal popup
+      req->send(200, "text/html",
+        "<html><body>Redirecting...</body></html>");
+      return;
+    }
+
+    // ── Windows captive portal check ──
+    if (url == "/connecttest.txt") {
+      req->send(200, "text/plain", "Microsoft Connect Test");
+      return;
+    }
+
+    // ── Apple captive portal check ──
+    if (url == "/hotspot-detect.html") {
+      req->send(200, "text/html", "<HTML><BODY>Success</BODY></HTML>");
+      return;
+    }
+
+    // ── Normal user traffic ──
+    if (!_staReady) {
+      req->redirect("http://192.168.4.1/");
+    } else {
+      req->send(404, "text/plain", "Not found");
+    }
+  });
   server.begin();
   Serial.println("[AP] Server started");
 }
