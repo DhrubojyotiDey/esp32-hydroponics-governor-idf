@@ -5,8 +5,7 @@
 
 extern TaskHandle_t pushTaskHandle;
 
-// Defined in .ino — routes to Serial + Telnet via log queue
-extern void enqueueLog(const char* msg);
+#include "log_manager.h"
 
 // ============================================================
 // CONFIG
@@ -83,7 +82,9 @@ void markSensorAlive(const char* name) {
     if (strcmp(sensors[i].name, name) == 0) {
       sensors[i].lastSeen = now;
       sensors[i].active   = true;
-      sensors[i].alive    = true;
+      // Do NOT set alive=true here — the health engine computes
+      // aliveness from lastSeen every cycle. Setting it directly
+      // bypasses transition detection and breaks RECOVERED alerts.
       break;
     }
   }
@@ -92,16 +93,20 @@ void markSensorAlive(const char* name) {
 
 // ============================================================
 // HEALTH ENGINE (CORE LOGIC)
+// Runs every 1s from loop().
+// DEAD alert:      fires every cycle while sensor is dead
+//                  so Serial / Telnet keeps printing until
+//                  the sensor is plugged back in.
+// RECOVERED alert: fires once on the DEAD → ALIVE transition.
+// All mutex/notify work happens outside the mutex to avoid
+// priority inversion.
 // ============================================================
 void updateSensorHealth() {
   uint32_t now = millis();
 
-  // Collect transitions inside mutex, act on them after release.
-  // This avoids calling xTaskNotifyGive() or enqueueLog() while
-  // holding the mutex, which could cause priority inversion.
-  struct Transition { bool dead; char name[16]; };
-  Transition transitions[MAX_SENSORS];
-  int transCount = 0;
+  struct Event { bool dead; bool transition; char name[16]; };
+  Event events[MAX_SENSORS];
+  int evtCount = 0;
 
   xSemaphoreTake(trayMutex, portMAX_DELAY);
 
@@ -116,27 +121,36 @@ void updateSensorHealth() {
       s.alive = (now - s.lastSeen) < s.timeout;
     }
 
-    if (s.prevAlive != s.alive && transCount < MAX_SENSORS) {
-      transitions[transCount].dead = !s.alive;
-      strncpy(transitions[transCount].name, s.name, 15);
-      transitions[transCount].name[15] = '\0';
-      transCount++;
+    bool transition = (s.prevAlive != s.alive);
+
+    // Record event if:
+    //   - sensor just died (transition ALIVE→DEAD)
+    //   - sensor is already dead (repeat alert every cycle)
+    //   - sensor just recovered (transition DEAD→ALIVE, once)
+    if (!s.alive || (s.alive && transition)) {
+      if (evtCount < MAX_SENSORS) {
+        events[evtCount].dead       = !s.alive;
+        events[evtCount].transition = transition;
+        strncpy(events[evtCount].name, s.name, 15);
+        events[evtCount].name[15] = '\0';
+        evtCount++;
+      }
     }
   }
 
   xSemaphoreGive(trayMutex);
 
-  // Act on transitions outside the mutex
+  // Act outside mutex
   bool shouldNotify = false;
-  for (int i = 0; i < transCount; i++) {
-    char msg[64];
-    if (transitions[i].dead) {
-      snprintf(msg, sizeof(msg), "[ALERT] Sensor %s DEAD", transitions[i].name);
+  for (int i = 0; i < evtCount; i++) {
+    if (events[i].dead) {
+      // Fires every cycle while dead
+      LOG_WARN("Health", "Sensor '%s' is DEAD — no data received", events[i].name);
     } else {
-      snprintf(msg, sizeof(msg), "[INFO] Sensor %s RECOVERED", transitions[i].name);
+      // Fires once on recovery
+      LOG_INFO("Health", "Sensor '%s' RECOVERED", events[i].name);
+      shouldNotify = true;
     }
-    enqueueLog(msg);
-    shouldNotify = true;
   }
 
   if (shouldNotify && pushTaskHandle) {

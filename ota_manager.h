@@ -8,6 +8,7 @@
 #include <AsyncTCP.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include "log_manager.h"
 
 // Provided by sensor_manager.h
 extern String getSensorJSON();
@@ -51,8 +52,9 @@ bool           _staReady      = false;
 bool           _connFailed    = false;
 String         _staIP         = "";
 unsigned long  _connStart     = 0;
-unsigned long  _apShutdownTime = 0;   // set when home WiFi user visits dashboard
-unsigned long  _dashReadyTime  = 0;   // set 4s after STA connects (sensors need warmup)
+unsigned long  _apShutdownTime = 0;
+unsigned long  _dashReadyTime  = 0;
+uint8_t        _connRetry     = 0;   // AUTH_EXPIRE retry counter (max 3)
 volatile bool  shouldReboot   = false;
 
 // ============================================================
@@ -61,7 +63,7 @@ volatile bool  shouldReboot   = false;
 void onEvent(AsyncWebSocket* srv, AsyncWebSocketClient* client,
              AwsEventType type, void* arg, uint8_t* data, size_t len) {
   if (type == WS_EVT_CONNECT) {
-    Serial.printf("[WS] Client #%u connected\n", client->id());
+    LOG_INFO("WS", "Client #%u connected", client->id());
   } else if (type == WS_EVT_DATA) {
     if (len >= 6 && strncmp((char*)data, "reboot", 6) == 0) {
       shouldReboot = true;
@@ -146,20 +148,35 @@ void _setupSTAServices() {
   _connFailed     = false;
   _staReady       = true;
   _connStart      = 0;
-  _apShutdownTime = 0;        // NOT set here — AP stays until user visits dashboard
-  _dashReadyTime  = millis() + 4000;  // 4s warmup for sensors to produce first data
+  _apShutdownTime = millis() + 300000; // 5-min backstop
+  _dashReadyTime  = millis() + 20000;  // 20s: 4s sensor warmup + ~16s mDNS propagation
 
-  Serial.println("[STA] Connected! IP: " + _staIP);
-  Serial.println("[STA] AP stays live until user visits dashboard");
+  LOG_INFO("STA", "══ Provisioning services ══");
+  LOG_INFO("STA", "WiFi connected successfully!");
+  LOG_INFO("STA", "IP address  : %s", _staIP.c_str());
+  LOG_INFO("STA", "Gateway     : %s", WiFi.gatewayIP().toString().c_str());
+  LOG_INFO("STA", "Subnet mask : %s", WiFi.subnetMask().toString().c_str());
+  LOG_INFO("STA", "RSSI        : %d dBm", WiFi.RSSI());
+  LOG_INFO("STA", "mDNS        : http://hydroponics.local");
+  LOG_INFO("STA", "AP backstop : 5 min");
+  LOG_INFO("STA", "Dash ready  : ~20s (sensor warmup + mDNS propagation)");
 
+  LOG_INFO("STA", "Starting mDNS...");
   MDNS.begin(ota_hostname);
+  LOG_INFO("STA", "mDNS ready: http://hydroponics.local");
+
+  LOG_INFO("STA", "Starting OTA...");
   ArduinoOTA.setHostname(ota_hostname);
   ArduinoOTA.begin();
+  LOG_INFO("STA", "OTA ready at hydroponics.local:3232");
 
+  LOG_INFO("STA", "Starting Telnet on port 23...");
   telnetServer.onClient(&handleTelnetClient, NULL);
   telnetServer.begin();
+  LOG_INFO("STA", "Telnet ready");
 
-  Serial.println("[STA] All services ready");
+  LOG_INFO("STA", "All provisioning services online");
+  LOG_INFO("STA", "══ Provisioning services ══");
 }
 
 // ============================================================
@@ -263,9 +280,9 @@ input:focus{border-color:#5dbb63}
     border-top-color:#5dbb63;border-radius:50%;
     animation:spin .75s linear infinite;flex-shrink:0;display:none}
 .sp.on{display:inline-block}
-#instbox{display:none;margin-top:.75rem;padding:.75rem .8rem;
+#instbox{display:none;margin-top:.75rem;padding:.85rem .9rem;
          border:1px solid #2a4a2a;border-radius:2px;
-         font-size:.68rem;color:#5a7a5a;line-height:1.7;
+         font-size:.72rem;color:#5a7a5a;line-height:1.9;
          letter-spacing:.05em}
 #instbox strong{color:#5dbb63}
 </style>
@@ -482,6 +499,8 @@ function pollDashReady(){
       setBtn('UI Ready \u2714',false,true);
       setTimeout(function(){showComplete(_ip,_local);},800);
     } else {
+      // Show a countdown so the user knows to wait
+      setBtn('Preparing UI\u2026 (almost ready)',true,true);
       setTimeout(pollDashReady,1000);
     }
   }).catch(function(){setTimeout(pollDashReady,1000);});
@@ -493,21 +512,28 @@ function showComplete(ip,local){
   sp.className='sp';
   btn.disabled=false;
   btn.classList.add('complete');
-  // Button copies the .local address — easier to type than an IP
-  tx.textContent='Copy  '+local;
+  tx.textContent='Copy address: '+local;
   btn.onclick=function(){
     doCopy(local);
     tx.textContent='Copied! \u2714';
-    setTimeout(function(){tx.textContent='Copy  '+local;},2000);
+    setTimeout(function(){tx.textContent='Copy address: '+local;},2000);
   };
 
-  // Instruction box — .local as primary, IP as fallback
+  // Clear numbered steps — critical for preventing "page not found" confusion
   var ib=document.getElementById('instbox');
-  ib.innerHTML='Please connect to <strong>'+enc(_selSSID)+'</strong>'
-    +' &amp; visit <strong>'+local+'</strong>'
-    +' to view your dashboard.'
-    +'<br><span style="font-size:.6rem;color:#3a5a3a">'
-    +'If that doesn\'t work, try <strong>http://'+ip+'</strong></span>';
+  ib.innerHTML=
+    '<strong style="color:#5dbb63;font-size:.75rem;letter-spacing:.08em">NEXT STEPS</strong><br><br>'
+    +'<span style="color:#a8d5a2">1.</span> Close this page<br>'
+    +'<span style="color:#a8d5a2">2.</span> Go to WiFi settings<br>'
+    +'<span style="color:#a8d5a2">3.</span> Connect to <strong>'+enc(_selSSID)+'</strong><br>'
+    +'<span style="color:#a8d5a2">4.</span> Open your browser and visit:<br>'
+    +'<strong style="color:#5dbb63;font-size:.85rem">'+local+'</strong><br>'
+    +'<span style="font-size:.62rem;color:#3a5a3a;margin-top:.3rem;display:block">'
+    +'If that doesn\'t resolve, use the IP address:<br>'
+    +'<strong>http://'+ip+'</strong></span>'
+    +'<span style="font-size:.62rem;color:#3a5a3a;display:block;margin-top:.4rem">'
+    +'\u26a0\ufe0f The page may take 15\u201330 seconds to load<br>'
+    +'on first visit after switching WiFi networks.</span>';
   ib.style.display='block';
 }
 function doCopy(txt){
@@ -685,9 +711,9 @@ void _startProvisioning() {
   IPAddress apIP = WiFi.softAPIP();
   dnsServer.start(53, "*", apIP);
 
-  Serial.println("[AP] Started: " + apIP.toString());
-
-  // Trigger first async scan immediately
+  LOG_INFO("AP", "Provisioning mode starting — SSID: %s", AP_SSID);
+  LOG_INFO("AP", "Captive portal at http://192.168.4.1");
+  LOG_INFO("AP", "Starting async WiFi scan...");
   WiFi.scanNetworks(true);
 
   // ── Serve captive portal / dashboard ──
@@ -699,7 +725,7 @@ void _startProvisioning() {
         IPAddress cli = req->client()->remoteIP();
         if (cli[2] != 4) {  // not 192.168.4.x — home WiFi client
           _apShutdownTime = millis() + 3000;
-          Serial.println("[AP] Home WiFi client visited dashboard — AP shutdown in 3s");
+          LOG_INFO("AP", "Home WiFi client on dashboard — AP shutdown in 3s");
         }
       }
       req->send_P(200, "text/html", _dash_html);
@@ -711,6 +737,8 @@ void _startProvisioning() {
   // ── WiFi scan results ──
   // Does NOT auto-trigger another scan — manual only via doScan() in JS
   server.on("/scan", HTTP_GET, [](AsyncWebServerRequest* req) {
+    int n = WiFi.scanComplete();
+    LOG_DEBUG("SCAN", "/scan requested — scanComplete=%d", n);
     req->send(200, "application/json", getScanJSON());
   });
 
@@ -722,6 +750,7 @@ void _startProvisioning() {
       json = "{\"scanning\":true,\"count\":0}";
     } else if (n >= 0) {
       json = "{\"scanning\":false,\"count\":" + String(n) + "}";
+      LOG_INFO("SCAN", "Scan complete — %d networks found", n);
     } else {
       json = "{\"scanning\":false,\"count\":0}";
     }
@@ -755,27 +784,28 @@ void _startProvisioning() {
       return;
     }
 
+    LOG_INFO("SAVE", "Credentials received — SSID: %s (%d char password)", ssid.c_str(), pass.length());
+    LOG_INFO("SAVE", "Writing to NVS...");
+
     // Persist to NVS
     Preferences p;
     p.begin("wifi", false);
     p.putString("s", ssid);
     p.putString("p", pass);
     p.end();
+    LOG_INFO("SAVE", "NVS write complete");
 
     // Begin STA connection — AP stays alive
     _connecting  = true;
     _connFailed  = false;
     _connStart   = millis();
 
-    // Do NOT use WiFi.config() here — injecting a static IP during
-    // AP_STA mode disrupts the DHCP auth timing and causes AUTH_EXPIRE.
-    // Static IP is applied only on direct STA boot (credentials already
-    // exist). For first-time provisioning, DHCP is the safe path.
-    WiFi.disconnect(true);   // clear any lingering connection state
+    LOG_DEBUG("WiFi", "Clearing previous connection state...");
+    WiFi.disconnect(true);
     delay(100);
+    LOG_INFO("WiFi", "WiFi.begin() for SSID: %s", ssid.c_str());
     WiFi.begin(ssid.c_str(), pass.c_str());
-
-    Serial.println("[WiFi] Connecting to: " + ssid);
+    LOG_INFO("WiFi", "Monitoring connection status in handleOTA()...");
 
     req->send(200, "application/json", "{\"status\":\"connecting\"}");
   });
@@ -843,7 +873,7 @@ void _startProvisioning() {
     }
   });
   server.begin();
-  Serial.println("[AP] Server started");
+  LOG_INFO("AP", "Server started");
 }
 
 // ============================================================
@@ -871,21 +901,21 @@ void setupWiFiAndOTA() {
   WiFi.mode(WIFI_STA);
 
   if (!WiFi.config(STATIC_IP, GATEWAY, SUBNET, DNS_SRV)) {
-    Serial.println("[WiFi] Static IP failed — falling back to DHCP");
+    LOG_WARN("WiFi", "Static IP failed — using DHCP");
   }
 
   WiFi.begin(ssid.c_str(), pass.c_str());
 
-  Serial.print("[WiFi] Connecting");
+  LOG_INFO("WiFi", "Connecting to saved SSID: %s", ssid.c_str());
   int c = 0;
   while (WiFi.status() != WL_CONNECTED && c < 20) {
     delay(500);
-    Serial.print(".");
+    if (c % 4 == 0) LOG_DEBUG("WiFi", "Still connecting... (%ds)", c / 2);
     c++;
   }
 
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("\n[WiFi] Failed — clearing credentials, rebooting");
+    LOG_ERROR("WiFi", "Failed to connect — clearing credentials, rebooting");
     Preferences p;
     p.begin("wifi", false);
     p.clear();
@@ -893,8 +923,7 @@ void setupWiFiAndOTA() {
     ESP.restart();
   }
 
-  Serial.println("\n[WiFi] Connected!");
-  Serial.println("[WiFi] IP: " + WiFi.localIP().toString());
+  LOG_INFO("WiFi", "Connected! IP: %s", WiFi.localIP().toString().c_str());
 
   WiFi.softAPdisconnect(true);
   _apMode   = false;
@@ -921,7 +950,8 @@ void setupWiFiAndOTA() {
   ArduinoOTA.begin();
 
   server.begin();
-  Serial.println("[HTTP] Server started at " + _staIP);
+  LOG_INFO("HTTP", "Server started at http://%s", _staIP.c_str());
+  LOG_INFO("HTTP", "mDNS ready at http://hydroponics.local");
 }
 
 // ============================================================
@@ -948,42 +978,78 @@ void handleOTA() {
       _apMode         = false;
       WiFi.softAPdisconnect(true);
       dnsServer.stop();
-      Serial.println("[AP] Shut down — captive grace period expired");
+      LOG_INFO("AP", "Shut down — grace period expired");
     }
 
     // ── Monitor ongoing connection attempt ──
     if (_connecting) {
       wl_status_t wst = WiFi.status();
 
+      // Log WiFi status every second
+      static unsigned long _lastStatusLog = 0;
+      if (millis() - _lastStatusLog >= 1000) {
+        _lastStatusLog = millis();
+        const char* stStr = "UNKNOWN";
+        switch (wst) {
+          case WL_IDLE_STATUS:    stStr = "IDLE";           break;
+          case WL_NO_SSID_AVAIL:  stStr = "NO_SSID_AVAIL";  break;
+          case WL_SCAN_COMPLETED: stStr = "SCAN_COMPLETED"; break;
+          case WL_CONNECTED:      stStr = "CONNECTED";      break;
+          case WL_CONNECT_FAILED: stStr = "CONNECT_FAILED"; break;
+          case WL_CONNECTION_LOST:stStr = "CONNECTION_LOST";break;
+          case WL_DISCONNECTED:   stStr = "DISCONNECTED";   break;
+        }
+        LOG_DEBUG("WiFi", "Status: %s | elapsed: %lums | retry: %d",
+          stStr, millis() - _connStart, _connRetry);
+      }
+
       if (wst == WL_CONNECTED) {
+        LOG_INFO("WiFi", "Connected successfully on attempt %d", _connRetry + 1);
+        _connRetry = 0;
         _setupSTAServices();
 
-      } else if (wst == WL_CONNECT_FAILED ||
-                 wst == WL_NO_SSID_AVAIL) {
-        // Explicit failure
-        _connecting  = false;
-        _connFailed  = true;
-        _connStart   = 0;
-        Serial.println("[WiFi] Connection failed (explicit)");
+      } else if (wst == WL_CONNECT_FAILED || wst == WL_NO_SSID_AVAIL) {
+        // Definitive failure — wrong password or SSID truly not found
+        _connecting = false;
+        _connFailed = true;
+        _connStart  = 0;
+        _connRetry  = 0;
+        LOG_ERROR("WiFi", "Connection failed — status %d (wrong password or SSID not found)", (int)wst);
 
       } else if (wst == WL_DISCONNECTED &&
-                 _connStart > 0 && millis() - _connStart > 5000) {
-        // AUTH_EXPIRE and similar handshake failures land here —
-        // status drops to DISCONNECTED but never reaches CONNECT_FAILED.
-        // After 5s grace window, treat it as a failure.
-        _connecting  = false;
-        _connFailed  = true;
-        _connStart   = 0;
-        WiFi.disconnect(true);
-        Serial.println("[WiFi] Connection failed (AUTH_EXPIRE or timeout)");
+                 _connStart > 0 && millis() - _connStart > 15000) {
+        // AUTH_EXPIRE — router dropped the handshake, likely radio contention
+        // from AP_STA mode. Retry up to 3 times before declaring failure.
+        if (_connRetry < 3) {
+          _connRetry++;
+          _connStart = millis();
+          LOG_WARN("WiFi", "AUTH_EXPIRE — retry %d/3 (radio contention in AP_STA mode)", _connRetry);
+          WiFi.disconnect(true);
+          delay(200);
+          // Re-read stored SSID for retry
+          Preferences pr;
+          pr.begin("wifi", true);
+          String ssid = pr.getString("s", "");
+          String pass = pr.getString("p", "");
+          pr.end();
+          WiFi.begin(ssid.c_str(), pass.c_str());
+          LOG_INFO("WiFi", "WiFi.begin() retry for: %s", ssid.c_str());
+        } else {
+          _connecting = false;
+          _connFailed = true;
+          _connStart  = 0;
+          _connRetry  = 0;
+          WiFi.disconnect(true);
+          LOG_ERROR("WiFi", "AUTH_EXPIRE after 3 retries — check router or try again");
+        }
 
       } else if (_connStart > 0 && millis() - _connStart > 30000) {
-        // Hard timeout fallback
-        _connecting  = false;
-        _connFailed  = true;
-        _connStart   = 0;
+        _connecting = false;
+        _connFailed = true;
+        _connStart  = 0;
+        _connRetry  = 0;
         WiFi.disconnect(true);
-        Serial.println("[WiFi] Connection timed out");
+        LOG_ERROR("WiFi", "Hard timeout after 30s");
       }
     }
 
@@ -997,7 +1063,7 @@ void handleOTA() {
     static unsigned long lastReconnect = 0;
     if (WiFi.status() != WL_CONNECTED) {
       if (millis() - lastReconnect > 30000) {
-        Serial.println("[WiFi] Lost connection, reconnecting...");
+        LOG_WARN("WiFi", "Lost connection, reconnecting...");
         WiFi.reconnect();
         lastReconnect = millis();
       }
