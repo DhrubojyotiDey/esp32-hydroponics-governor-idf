@@ -1,0 +1,29 @@
+# ── Line-ending rules for ESP-IDF / PlatformIO project ───────
+# Keep source and config files in LF so the ESP-IDF toolchain
+# (running on WSL/Linux or inside PlatformIO's environment) is 
+# never tripped up by Windows CRLF endings.
+
+# C/C++ source — always LF
+*.c     text eol=lf
+*.h     text eol=lf
+*.cpp   text eol=lf
+*.hpp   text eol=lf
+
+# Web assets embedded into firmware — LF
+*.html  text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+
+# Build/config files — LF
+*.ini   text eol=lf
+*.csv   text eol=lf
+*.defaults text eol=lf
+sdkconfig  text eol=lf
+
+# Docs — native (editors handle them)
+*.md    text
+
+# Binary files — no line-ending conversion
+*.bin   binary
+*.elf   binary
+*.a     binary
