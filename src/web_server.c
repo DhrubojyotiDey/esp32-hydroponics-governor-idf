@@ -283,7 +283,7 @@ static esp_err_t dashready_handler(httpd_req_t *req) {
 /* ── GET /data — snapshot sensor JSON (REST fallback) ────── */
 static esp_err_t data_handler(httpd_req_t *req) {
     if (wifi_manager_get_state() != WIFI_MGR_CONNECTED) {
-        httpd_resp_send_err(req, HTTPD_503_SERVICE_UNAVAILABLE, "Not connected");
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Not connected");
         return ESP_OK;
     }
     char buf[WS_JSON_BUF_SIZE];
