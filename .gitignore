@@ -1,0 +1,15 @@
+# ── PlatformIO build outputs ─────────────────────────────────
+.pio/
+
+# ── ESP-IDF generated config (DO NOT commit — rebuild from sdkconfig.defaults)
+sdkconfig
+
+# ── VS Code workspace settings (local only) ─────────────────
+.vscode/
+
+# ── OS generated files ───────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Staging / scratch folder (original flat files) ──────────
+files/

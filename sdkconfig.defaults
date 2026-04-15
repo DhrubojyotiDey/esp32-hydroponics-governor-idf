@@ -1,0 +1,31 @@
+# ============================================================
+#  sdkconfig.defaults — ESP32 Hydroponics Governor
+#  Applied on top of IDF defaults before every build.
+#  Edit here, not in sdkconfig (sdkconfig is git-ignored).
+# ============================================================
+
+# WebSocket support in esp_http_server — required for real-time dashboard
+CONFIG_HTTPD_WS_SUPPORT=y
+
+# Allow larger request headers (needed for some Android browsers)
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+
+# Maximum concurrent URI handlers (we register ~12)
+CONFIG_HTTPD_MAX_URI_HANDLERS=16
+
+# mDNS — keep services list small (we only need HTTP)
+CONFIG_MDNS_MAX_SERVICES=5
+CONFIG_MDNS_TASK_STACK_SIZE=4096
+
+# WiFi — softAP support required for captive portal provisioning
+CONFIG_ESP_WIFI_SOFTAP_SUPPORT=y
+
+# Increase lwIP socket count: HTTP server + DNS (UDP) + WebSocket clients
+CONFIG_LWIP_MAX_SOCKETS=16
+CONFIG_LWIP_SO_REUSE=y
+
+# NVS — used for WiFi credential storage
+CONFIG_NVS_ASSERT_ERROR_CHECK=n
+
+# OTA — no rollback for simplicity; can be enabled later
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=n

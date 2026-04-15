@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Hydroponics</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{background:#0a0f0a;color:#a8d5a2;font-family:monospace;
+         min-height:100vh;padding:1.5rem}
+    header{display:flex;align-items:center;justify-content:space-between;
+           margin-bottom:1.5rem;border-bottom:1px solid #1a3a1a;
+           padding-bottom:.75rem}
+    .logo{color:#5dbb63;font-size:1rem;letter-spacing:.2em;text-transform:uppercase}
+    .ws-dot{width:8px;height:8px;border-radius:50%;background:#3a5a3a;
+            transition:background .3s}
+    .ws-dot.live{background:#5dbb63;box-shadow:0 0 6px #5dbb63}
+    .ws-dot.err{background:#ff4444}
+    .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));
+          gap:1rem;margin-bottom:1.5rem}
+    .card{background:#0d150d;border:1px solid #1a3a1a;border-radius:4px;
+          padding:1.25rem;position:relative;overflow:hidden}
+    .card::before{content:'';position:absolute;top:0;left:0;right:0;
+                  height:2px;background:#5dbb63;opacity:.4}
+    .card-label{font-size:.65rem;letter-spacing:.15em;color:#3a6a3a;
+                text-transform:uppercase;margin-bottom:.5rem}
+    .card-value{font-size:2rem;color:#5dbb63;line-height:1}
+    .card-unit{font-size:.75rem;color:#5a7a5a;margin-top:.3rem;
+               letter-spacing:.08em}
+    .card-status{font-size:.6rem;letter-spacing:.1em;margin-top:.6rem;
+                 text-transform:uppercase}
+    .card-status.alive{color:#5dbb63}
+    .card-status.dead{color:#ff4444}
+    .health-row{display:flex;gap:1rem;flex-wrap:wrap;margin-bottom:1.5rem}
+    .badge{font-size:.65rem;letter-spacing:.12em;text-transform:uppercase;
+           padding:.3rem .6rem;border-radius:2px;border:1px solid #2a4a2a}
+    .badge.alive{border-color:#5dbb63;color:#5dbb63}
+    .badge.dead{border-color:#ff4444;color:#ff4444}
+    .footer{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}
+    .btn{background:#0d150d;border:1px solid #2a4a2a;color:#5dbb63;
+         padding:.55rem 1.1rem;font-family:monospace;font-size:.72rem;
+         letter-spacing:.1em;text-transform:uppercase;cursor:pointer;
+         border-radius:2px;transition:border-color .2s,box-shadow .2s}
+    .btn:hover{border-color:#5dbb63;box-shadow:0 0 8px rgba(93,187,99,.3)}
+    .btn.danger{color:#ff6666;border-color:#3a1a1a}
+    .btn.danger:hover{border-color:#ff4444;box-shadow:0 0 8px rgba(255,68,68,.2)}
+    .stat{font-size:.6rem;color:#2a4a2a;letter-spacing:.08em;margin-left:auto}
+    /* OTA panel */
+    #ota-panel{display:none;margin-top:1rem;padding:1rem;
+               background:#0d150d;border:1px solid #2a4a2a;border-radius:4px}
+    #ota-panel label{font-size:.65rem;color:#5a7a5a;letter-spacing:.1em;
+                     text-transform:uppercase;display:block;margin-bottom:.5rem}
+    #ota-file{background:#111f11;border:1px solid #2a4a2a;color:#a8d5a2;
+              padding:.5rem;font-family:monospace;font-size:.75rem;
+              border-radius:2px;width:100%;margin-bottom:.75rem}
+    #ota-progress{height:4px;background:#1a2a1a;border-radius:2px;
+                  overflow:hidden;display:none;margin-bottom:.5rem}
+    #ota-bar{height:100%;width:0%;background:#5dbb63;
+             border-radius:2px;transition:width .2s}
+    #ota-msg{font-size:.65rem;color:#5a7a5a;letter-spacing:.05em;min-height:.9rem}
+  </style>
+</head>
+<body>
+  <header>
+    <span class="logo">&#9670; Hydroponics</span>
+    <span class="ws-dot" id="wsdot" title="WebSocket"></span>
+  </header>
+
+  <div class="grid">
+    <div class="card">
+      <div class="card-label">Temperature</div>
+      <div class="card-value" id="val-temp">--</div>
+      <div class="card-unit">&deg;C &mdash; DHT11</div>
+      <div class="card-status" id="st-dht">&#9675; waiting</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Humidity</div>
+      <div class="card-value" id="val-hum">--</div>
+      <div class="card-unit">% RH</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Water Flow</div>
+      <div class="card-value" id="val-flow">--</div>
+      <div class="card-unit">L / min &mdash; YF-S201</div>
+      <div class="card-status" id="st-flow">&#9675; waiting</div>
+    </div>
+  </div>
+
+  <div class="health-row" id="health-row"></div>
+
+  <div class="footer">
+    <button class="btn" onclick="toggleOTA()">OTA Update</button>
+    <button class="btn danger" onclick="doReboot()">Restart Device</button>
+    <span class="stat" id="stat">Connecting&hellip;</span>
+  </div>
+
+  <div id="ota-panel">
+    <label>Firmware Binary (.bin)</label>
+    <input type="file" id="ota-file" accept=".bin">
+    <div id="ota-progress"><div id="ota-bar"></div></div>
+    <div id="ota-msg"></div>
+    <button class="btn" onclick="doOTA()" style="margin-top:.5rem">Upload &amp; Flash</button>
+  </div>
+
+  <script>
+  var ws, wsDot=document.getElementById('wsdot'), statEl=document.getElementById('stat');
+
+  function init(){
+    ws=new WebSocket('ws://'+window.location.hostname+'/ws');
+
+    ws.onopen=function(){
+      wsDot.className='ws-dot live';
+      statEl.textContent='LIVE';
+    };
+
+    ws.onmessage=function(e){
+      var d;
+      try{d=JSON.parse(e.data);}catch(x){return;}
+
+      if(d.temp!==undefined) document.getElementById('val-temp').textContent=d.temp.toFixed(1);
+      if(d.hum!==undefined)  document.getElementById('val-hum').textContent=d.hum.toFixed(1);
+      if(d.flow!==undefined) document.getElementById('val-flow').textContent=d.flow.toFixed(2);
+
+      /* Per-sensor inline status under cards */
+      if(d.sensors){
+        setSensorStatus('dht', d.sensors.dht, 'st-dht');
+        setSensorStatus('flow',d.sensors.flow,'st-flow');
+        buildHealthRow(d.sensors);
+      }
+    };
+
+    ws.onclose=function(){
+      wsDot.className='ws-dot err';
+      statEl.textContent='RECONNECTING\u2026';
+      setTimeout(init,2000);
+    };
+    ws.onerror=function(){ws.close();};
+  }
+
+  function setSensorStatus(name,alive,elId){
+    var el=document.getElementById(elId);
+    if(!el)return;
+    el.className='card-status '+(alive?'alive':'dead');
+    el.textContent=(alive?'\u25CF ':'\u25CB ')+name.toUpperCase()+(alive?' ONLINE':' OFFLINE');
+  }
+
+  function buildHealthRow(sensors){
+    var row=document.getElementById('health-row');
+    var html='';
+    Object.keys(sensors).forEach(function(k){
+      var a=sensors[k];
+      html+='<span class="badge '+(a?'alive':'dead')+'">'
+           +k.toUpperCase()+(a?' \u25CF':' \u25CB')+'</span>';
+    });
+    row.innerHTML=html;
+  }
+
+  function doReboot(){
+    if(!confirm('Restart the device?'))return;
+    ws.send('reboot');
+    statEl.textContent='Rebooting\u2026';
+  }
+
+  function toggleOTA(){
+    var p=document.getElementById('ota-panel');
+    p.style.display=p.style.display==='block'?'none':'block';
+  }
+
+  function doOTA(){
+    var f=document.getElementById('ota-file').files[0];
+    if(!f){document.getElementById('ota-msg').textContent='Select a .bin file first.';return;}
+    var msg=document.getElementById('ota-msg');
+    var bar=document.getElementById('ota-bar');
+    var prog=document.getElementById('ota-progress');
+    prog.style.display='block';
+    bar.style.width='0%';
+    msg.textContent='Uploading\u2026';
+
+    var xhr=new XMLHttpRequest();
+    xhr.open('POST','/ota');
+    xhr.upload.onprogress=function(e){
+      if(e.lengthComputable){
+        var pct=Math.round(e.loaded/e.total*100);
+        bar.style.width=pct+'%';
+        msg.textContent='Uploading\u2026 '+pct+'%';
+      }
+    };
+    xhr.onload=function(){
+      if(xhr.status===200){
+        bar.style.width='100%';
+        msg.textContent='Flash complete. Rebooting\u2026';
+      } else {
+        msg.textContent='OTA failed (HTTP '+xhr.status+')';
+      }
+    };
+    xhr.onerror=function(){
+      msg.textContent='Upload error.';
+    };
+    xhr.send(f);
+  }
+
+  window.onload=init;
+  </script>
+</body>
+</html>
