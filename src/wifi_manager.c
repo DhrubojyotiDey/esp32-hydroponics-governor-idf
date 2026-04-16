@@ -32,6 +32,7 @@ static volatile bool              s_scanning       = false;
 static int64_t                    s_conn_start_us  = 0;
 static bool                       s_sta_netif_done = false; /* created once only */
 static wifi_mgr_ap_shutdown_cb_t  s_shutdown_cb    = NULL;
+static esp_err_t                  s_last_scan_err  = ESP_OK;
 
 /* ── NVS helpers ─────────────────────────────────────────── */
 
@@ -368,7 +369,11 @@ esp_err_t wifi_manager_reconnect(void) {
 }
 
 esp_err_t wifi_manager_scan_start(void) {
-    s_scanning = true;
+    if (s_scanning) {
+        ESP_LOGI(TAG, "Scan request ignored: already running");
+        return ESP_ERR_INVALID_STATE;
+    }
+
     wifi_scan_config_t sc = {
         .ssid        = NULL,
         .bssid       = NULL,
@@ -376,14 +381,34 @@ esp_err_t wifi_manager_scan_start(void) {
         .show_hidden = false,
         .scan_type   = WIFI_SCAN_TYPE_ACTIVE,
     };
-    return esp_wifi_scan_start(&sc, false);
+    s_scanning = true;
+    s_last_scan_err = ESP_OK;
+
+    esp_err_t ret = esp_wifi_scan_start(&sc, false);
+    if (ret != ESP_OK) {
+        s_scanning = false;
+        s_last_scan_err = ret;
+        ESP_LOGW(TAG, "Scan start failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "WiFi scan started");
+    return ESP_OK;
 }
 
 void wifi_manager_get_scan_json(char *buf, size_t len) {
     if (s_scanning) { strncpy(buf, "[]", len); return; }
 
+    if (s_last_scan_err != ESP_OK) {
+        ESP_LOGW(TAG, "Returning empty scan list after scan error: %s",
+                 esp_err_to_name(s_last_scan_err));
+        strncpy(buf, "[]", len);
+        return;
+    }
+
     uint16_t ap_num = 0;
     esp_wifi_scan_get_ap_num(&ap_num);
+    ESP_LOGI(TAG, "Scan complete, APs found: %u", (unsigned)ap_num);
     if (ap_num == 0) { strncpy(buf, "[]", len); return; }
 
     uint16_t fetch = ap_num > 20 ? 20 : ap_num;
@@ -407,11 +432,25 @@ void wifi_manager_get_scan_json(char *buf, size_t len) {
         if (dup) continue;
 
         bool open = (aps[i].authmode == WIFI_AUTH_OPEN);
+        char ssid_json[96];
+        size_t out = 0;
+
+        for (size_t k = 0; aps[i].ssid[k] != '\0' && out < sizeof(ssid_json) - 3; k++) {
+            char ch = (char)aps[i].ssid[k];
+            if (ch == '\\' || ch == '"') {
+                ssid_json[out++] = '\\';
+                ssid_json[out++] = ch;
+            } else if ((unsigned char)ch >= 0x20) {
+                ssid_json[out++] = ch;
+            }
+        }
+        ssid_json[out] = '\0';
+
         if (!first) pos += snprintf(buf + pos, len - pos, ",");
         first = false;
         pos += snprintf(buf + pos, len - pos,
             "{\"ssid\":\"%s\",\"rssi\":%d,\"open\":%s}",
-            (char *)aps[i].ssid, aps[i].rssi, open ? "true" : "false");
+            ssid_json, aps[i].rssi, open ? "true" : "false");
     }
     snprintf(buf + pos, len - pos, "]");
     free(aps);

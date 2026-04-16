@@ -43,15 +43,3 @@ const size_t {array_name}_len = {len(data) - 1};
 
 # Run before anything compiles
 env.Execute(generate_html_headers)
-
-def fix_esptool_erase_flag(source, target, env):
-    # PlatformIO improperly places upload_flags before the 'write_flash' command
-    # causing esptool.py to reject it. We intercept it here and inject it properly.
-    if "UPLOADERFLAGS" in env:
-        flags = env["UPLOADERFLAGS"]
-        if "--erase-all" in flags:
-            flags.remove("--erase-all")
-            # Force the erase-all flag directly onto the executable invocation
-            env.Append(UPLOADCMD=" --erase-all")
-
-env.AddPreAction("upload", fix_esptool_erase_flag)

@@ -28,6 +28,7 @@ static httpd_handle_t s_server    = NULL;
 static bool           s_dash_ready = false;
 static char           s_dash_ip[20] = "";
 static int64_t        s_dash_ready_at_us = 0;  /* set on STA connect */
+static bool           s_ap_shutdown_scheduled = false;
 
 /* ── Async WebSocket send ────────────────────────────────────
  * httpd_ws_send_frame_async() must be called from within the
@@ -85,6 +86,13 @@ void web_server_set_dash_ready(bool ready, const char *ip) {
  * ║  URI HANDLERS                                           ║
  * ╚══════════════════════════════════════════════════════════╝ */
 
+static void delayed_ap_shutdown_task(void *arg) {
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    wifi_manager_ap_shutdown();
+    s_ap_shutdown_scheduled = false;
+    vTaskDelete(NULL);
+}
+
 /* ── GET / — captive portal or dashboard ─────────────────── */
 static esp_err_t root_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
@@ -93,10 +101,15 @@ static esp_err_t root_handler(httpd_req_t *req) {
 
     if (wifi_manager_get_state() == WIFI_MGR_CONNECTED) {
         /* If the visitor arrives from home WiFi, AP is no longer needed */
-        if (wifi_manager_ap_active()) {
+        if (wifi_manager_ap_active() && !s_ap_shutdown_scheduled) {
             /* Schedule AP shutdown — leave 3s grace for the response to land */
             ESP_LOGI(TAG, "Dashboard hit from home WiFi — scheduling AP shutdown");
-            wifi_manager_ap_shutdown();
+            s_ap_shutdown_scheduled = true;
+            if (xTaskCreate(delayed_ap_shutdown_task, "ap_shutdown",
+                            2048, NULL, 4, NULL) != pdPASS) {
+                s_ap_shutdown_scheduled = false;
+                ESP_LOGW(TAG, "Failed to schedule AP shutdown task");
+            }
         }
         const size_t dash_len = page_dash_html_len;
         httpd_resp_send(req, (const char *)page_dash_html_start, dash_len);
@@ -109,12 +122,19 @@ static esp_err_t root_handler(httpd_req_t *req) {
 
 static esp_err_t scan_handler(httpd_req_t *req) {
     /* Start a new scan explicitly only if not already running */
+    esp_err_t ret = ESP_OK;
     if (!wifi_manager_scan_running()) {
-        wifi_manager_scan_start();
+        ret = wifi_manager_scan_start();
     }
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    httpd_resp_sendstr(req, "{\"status\":\"started\"}");
+    if (ret == ESP_OK || ret == ESP_ERR_INVALID_STATE) {
+        ESP_LOGI(TAG, "/scan requested");
+        httpd_resp_sendstr(req, "{\"status\":\"started\"}");
+    } else {
+        ESP_LOGW(TAG, "/scan failed: %s", esp_err_to_name(ret));
+        httpd_resp_sendstr(req, "{\"status\":\"error\"}");
+    }
     return ESP_OK;
 }
 
@@ -122,6 +142,7 @@ static esp_err_t scan_handler(httpd_req_t *req) {
 static esp_err_t scanresults_handler(httpd_req_t *req) {
     char buf[2048];
     wifi_manager_get_scan_json(buf, sizeof(buf));
+    ESP_LOGI(TAG, "/scanresults -> %s", buf);
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");

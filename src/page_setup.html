@@ -164,7 +164,7 @@ input:focus, .net-sel.open { border-color: #5dbb63; box-shadow: inset 2px 2px 6p
       </div>
       <div class="net-list" id="net-list"></div>
     </div>
-    <button class="rfsh" id="rfsh" onclick="doScan()" title="Scan">
+    <button class="rfsh" id="rfsh" type="button" onclick="doScan()" title="Scan">
       <span id="rfsh-icon">&#8635;</span>
     </button>
   </div>
@@ -174,12 +174,12 @@ input:focus, .net-sel.open { border-color: #5dbb63; box-shadow: inset 2px 2px 6p
     <label>Password</label>
     <div class="pw-row">
       <input type="password" id="pw" placeholder="Enter password" autocomplete="off">
-      <button class="rfsh" onclick="togglePw()" title="Show/hide">&#128065;</button>
+      <button class="rfsh" type="button" onclick="togglePw()" title="Show/hide">&#128065;</button>
     </div>
     <div class="pw-err" id="pw-err"></div>
   </div>
 
-  <button class="btn" id="cbtn" onclick="onSubmit()" disabled>
+  <button class="btn" id="cbtn" type="button" onclick="onSubmit()" disabled>
     <div class="sp" id="bsp"></div>
     <span id="btxt">SELECT A NETWORK FIRST</span>
   </button>
@@ -300,6 +300,9 @@ function loadScan(){
       list.innerHTML=html;
       document.getElementById('net-sel-txt').textContent='-- Select network --';
       setBar('done');
+      _dropOpen=true;
+      document.getElementById('net-list').style.display='block';
+      document.getElementById('net-sel').classList.add('open');
     }
   }).catch(function(){
     document.getElementById('net-sel-txt').textContent='Scan failed \u2014 tap \u21BB';
