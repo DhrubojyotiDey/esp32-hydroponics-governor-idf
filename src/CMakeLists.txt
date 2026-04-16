@@ -1,9 +1,8 @@
-# This file was automatically generated for projects
-# without default 'CMakeLists.txt' file.
-
+# Native ESP-IDF component registry for the main application
 FILE(GLOB_RECURSE app_sources ${CMAKE_SOURCE_DIR}/src/*.c)
 
 idf_component_register(
     SRCS ${app_sources}
-    EMBED_TXTFILES "page_setup.html" "page_dash.html"
+    INCLUDE_DIRS "."
+    REQUIRES mdns
 )

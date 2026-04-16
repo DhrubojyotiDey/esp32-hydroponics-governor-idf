@@ -91,12 +91,12 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
         case WIFI_EVENT_STA_START:
             /*
              * Fired when WiFi driver starts STA.
-             * On the direct-STA path this is the first event;
-             * on the provisioning path the driver is already started
-             * by start_ap() so this fires only if the mode is
-             * switched or the driver restarted — not our normal case.
+             * Only connect if we are expecting to (direct STA mode).
+             * On APSTA provisioning, don't connect until save_handler.
              */
-            esp_wifi_connect();
+            if (s_state != WIFI_MGR_AP_ONLY) {
+                esp_wifi_connect();
+            }
             break;
 
         case WIFI_EVENT_STA_CONNECTED:
@@ -218,7 +218,7 @@ static void connect_sta(const char *ssid, const char *pass, bool open) {
     strncpy((char *)sta.sta.password, pass, sizeof(sta.sta.password) - 1);
 
     if (!open) {
-        sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+        sta.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
     }
     /* For open nets, threshold stays at WIFI_AUTH_OPEN (== 0, zero-init) */
 
@@ -279,7 +279,6 @@ esp_err_t wifi_manager_start(void) {
     if (!nvs_read(ssid, sizeof(ssid), pass, sizeof(pass))) {
         ESP_LOGI(TAG, "No credentials — starting provisioning AP");
         start_ap();
-        wifi_manager_scan_start();
         return ESP_OK;
     }
 
@@ -297,7 +296,7 @@ esp_err_t wifi_manager_start(void) {
     strncpy((char *)sta.sta.ssid,     ssid, sizeof(sta.sta.ssid) - 1);
     strncpy((char *)sta.sta.password, pass, sizeof(sta.sta.password) - 1);
     /* Direct STA path: assume secured. If open, user re-provisions. */
-    sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    sta.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
 
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
 
