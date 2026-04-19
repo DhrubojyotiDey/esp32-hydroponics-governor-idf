@@ -18,8 +18,7 @@ void web_server_stop(void);
  */
 void web_server_push_sensor_update(const char *json);
 
-/** Signal that sensors have warmed up and the dashboard is ready.
- *  Called ~4s after STA connects; enables /dashready to return true. */
+/** Signal dashboard readiness after the gateway check completes. */
 void web_server_set_dash_ready(bool ready, const char *ip);
 
 #endif /* WEB_SERVER_H */

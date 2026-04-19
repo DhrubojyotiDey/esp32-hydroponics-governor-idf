@@ -13,6 +13,9 @@
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_netif.h"
+#include "ping/ping_sock.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "WEB";
 
@@ -27,7 +30,6 @@ static const char *TAG = "WEB";
 static httpd_handle_t s_server    = NULL;
 static bool           s_dash_ready = false;
 static char           s_dash_ip[20] = "";
-static int64_t        s_dash_ready_at_us = 0;  /* set on STA connect */
 static bool           s_ap_shutdown_scheduled = false;
 
 static esp_err_t captive_portal_redirect(httpd_req_t *req) {
@@ -170,6 +172,20 @@ static esp_err_t scanstatus_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t keepalive_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t favicon_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_hdr(req, "Cache-Control", "max-age=3600");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 /* ── URL decoder ─────────────────────────────────────────────
  *
  * BUG FIX: The original parsed URL-encoded body values raw, without
@@ -268,9 +284,6 @@ static esp_err_t save_handler(httpd_req_t *req) {
     ESP_LOGI(TAG, "/save — SSID='%s' pass_len=%d open=%d",
              ssid, (int)strlen(pass), (int)open);
 
-    /* Sensor warmup gate: block /dashready for 4s after connect */
-    s_dash_ready_at_us = esp_timer_get_time() + 4000000LL;
-
     esp_err_t ret = wifi_manager_connect(ssid, pass, open);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req,
@@ -299,16 +312,30 @@ static esp_err_t status_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-/* ── GET /dashready — sensor warmup gate ────────────────── */
+/* ── POST /ap_shutdown — shut down AP on demand ─────────── */
+static esp_err_t ap_shutdown_handler(httpd_req_t *req) {
+    if (wifi_manager_ap_active() && !s_ap_shutdown_scheduled) {
+        ESP_LOGI(TAG, "AP shutdown requested via /ap_shutdown endpoint");
+        s_ap_shutdown_scheduled = true;
+        if (xTaskCreate(delayed_ap_shutdown_task, "ap_shutdown",
+                        2048, NULL, 4, NULL) != pdPASS) {
+            s_ap_shutdown_scheduled = false;
+            ESP_LOGW(TAG, "Failed to schedule AP shutdown task");
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"scheduled\"}");
+    return ESP_OK;
+}
+
+/* ── GET /dashready — gateway ping readiness gate ───────── */
 static esp_err_t dashready_handler(httpd_req_t *req) {
-    bool ready = (wifi_manager_get_state() == WIFI_MGR_CONNECTED) &&
-                 (s_dash_ready_at_us > 0) &&
-                 (esp_timer_get_time() >= s_dash_ready_at_us);
+    bool connected = (wifi_manager_get_state() == WIFI_MGR_CONNECTED);
 
     char buf[128];
     snprintf(buf, sizeof(buf),
         "{\"ready\":%s,\"ip\":\"%s\",\"local\":\"http://" MDNS_HOSTNAME ".local\"}",
-        ready ? "true" : "false", wifi_manager_get_ip());
+        connected ? "true" : "false", wifi_manager_get_ip());
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
@@ -347,7 +374,12 @@ static esp_err_t ws_handler(httpd_req_t *req) {
 
     /* First call with len=0 to get the frame length */
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
-    if (ret != ESP_OK || pkt.len == 0 || pkt.len > 32) return ESP_OK;
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (pkt.len == 0 || pkt.len > 32) {
+        return ESP_OK;
+    }
 
     uint8_t buf[33] = {0};
     pkt.payload = buf;
@@ -453,7 +485,7 @@ static esp_err_t not_found_handler(httpd_req_t *req, httpd_err_code_t err) {
 
 esp_err_t web_server_start(void) {
     httpd_config_t cfg        = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers      = 16;
+    cfg.max_uri_handlers      = 24;
     cfg.stack_size            = 8192;
     cfg.lru_purge_enable      = true;  /* drop oldest client on slot exhaustion */
 
@@ -471,8 +503,11 @@ esp_err_t web_server_start(void) {
         { .uri = "/scan",               .method = HTTP_GET,  .handler = scan_handler          },
         { .uri = "/scanresults",        .method = HTTP_GET,  .handler = scanresults_handler   },
         { .uri = "/scanstatus",         .method = HTTP_GET,  .handler = scanstatus_handler    },
+        { .uri = "/keepalive",          .method = HTTP_GET,  .handler = keepalive_handler     },
+        { .uri = "/favicon.ico",        .method = HTTP_GET,  .handler = favicon_handler       },
         { .uri = "/save",               .method = HTTP_POST, .handler = save_handler          },
         { .uri = "/status",             .method = HTTP_GET,  .handler = status_handler        },
+        { .uri = "/ap_shutdown",        .method = HTTP_POST, .handler = ap_shutdown_handler   },
         { .uri = "/dashready",          .method = HTTP_GET,  .handler = dashready_handler     },
         { .uri = "/data",               .method = HTTP_GET,  .handler = data_handler          },
         { .uri = "/ota",                .method = HTTP_POST, .handler = ota_handler           },

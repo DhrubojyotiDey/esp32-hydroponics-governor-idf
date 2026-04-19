@@ -27,6 +27,7 @@ static EventGroupHandle_t s_eg;
 /* Module state */
 static volatile wifi_mgr_state_t  s_state          = WIFI_MGR_IDLE;
 static char                       s_ip[20]         = "";
+static char                       s_gw_ip[20]      = "";
 static volatile bool              s_ap_active      = false;
 static volatile bool              s_scanning       = false;
 static int64_t                    s_conn_start_us  = 0;
@@ -35,6 +36,27 @@ static wifi_mgr_ap_shutdown_cb_t  s_shutdown_cb    = NULL;
 static esp_err_t                  s_last_scan_err  = ESP_OK;
 static char                       s_target_ssid[33] = "";
 static char                       s_scan_json[2048] = "[]";
+static char                       s_pending_ssid[33] = "";
+static char                       s_pending_pass[65] = "";
+static wifi_ap_record_t           s_scan_records[20];
+static uint16_t                   s_scan_record_count = 0;
+
+static void clear_pending_credentials(void) {
+    s_pending_ssid[0] = '\0';
+    s_pending_pass[0] = '\0';
+}
+
+static const wifi_ap_record_t *find_scanned_ap(const char *ssid) {
+    const wifi_ap_record_t *best = NULL;
+
+    for (uint16_t i = 0; i < s_scan_record_count; i++) {
+        if (strcmp((const char *)s_scan_records[i].ssid, ssid) != 0) continue;
+        if (!best || s_scan_records[i].rssi > best->rssi) {
+            best = &s_scan_records[i];
+        }
+    }
+    return best;
+}
 
 static void update_scan_cache(void) {
     uint16_t ap_num = 0;
@@ -42,6 +64,7 @@ static void update_scan_cache(void) {
     ESP_LOGI(TAG, "Scan complete, APs found: %u", (unsigned)ap_num);
 
     if (ap_num == 0) {
+        s_scan_record_count = 0;
         strncpy(s_scan_json, "[]", sizeof(s_scan_json));
         return;
     }
@@ -58,9 +81,13 @@ static void update_scan_cache(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to fetch scan records: %s", esp_err_to_name(ret));
         free(aps);
+        s_scan_record_count = 0;
         strncpy(s_scan_json, "[]", sizeof(s_scan_json));
         return;
     }
+
+    s_scan_record_count = fetch > 20 ? 20 : fetch;
+    memcpy(s_scan_records, aps, s_scan_record_count * sizeof(wifi_ap_record_t));
 
     int  pos   = 0;
     bool first = true;
@@ -185,25 +212,33 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
                      ev->reason, (long long)elapsed_ms);
 
             if (s_state == WIFI_MGR_CONNECTING) {
-                bool hard_fail =
-                    (ev->reason == WIFI_REASON_NO_AP_FOUND)            ||
-                    (ev->reason == WIFI_REASON_AUTH_FAIL)               ||
-                    (ev->reason == WIFI_REASON_ASSOC_FAIL)              ||
-                    (ev->reason == WIFI_REASON_HANDSHAKE_TIMEOUT)       ||
-                    (ev->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT)  ||
-                    (ev->reason == WIFI_REASON_MIC_FAILURE)             ||
-                    (elapsed_ms  > WIFI_CONNECT_TIMEOUT_MS);
+                bool auth_fail =
+                    (ev->reason == WIFI_REASON_AUTH_FAIL)              ||
+                    (ev->reason == WIFI_REASON_HANDSHAKE_TIMEOUT)      ||
+                    (ev->reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) ||
+                    (ev->reason == WIFI_REASON_MIC_FAILURE);
 
-                if (hard_fail) {
-                    s_state = WIFI_MGR_FAILED;
-                    xEventGroupSetBits(s_eg, BIT_STA_FAILED);
-                    ESP_LOGW(TAG, "Connection failed for '%s' - stopping retry",
+                s_state = WIFI_MGR_FAILED;
+                xEventGroupSetBits(s_eg, BIT_STA_FAILED);
+
+                if (auth_fail) {
+                    ESP_LOGW(TAG, "Authentication failed for '%s' - possible typo or wrong password",
                              s_target_ssid[0] ? s_target_ssid : "<unknown>");
+                    enqueue_log("[ALERT] Authentication failed - possible typo or wrong password");
+                    clear_pending_credentials();
+                } else if (ev->reason == WIFI_REASON_NO_AP_FOUND) {
+                    ESP_LOGW(TAG, "Connection failed for '%s' - access point not found",
+                             s_target_ssid[0] ? s_target_ssid : "<unknown>");
+                    clear_pending_credentials();
+                } else if (elapsed_ms > WIFI_CONNECT_TIMEOUT_MS) {
+                    ESP_LOGW(TAG, "Connection failed for '%s' - timed out after %d ms",
+                             s_target_ssid[0] ? s_target_ssid : "<unknown>",
+                             WIFI_CONNECT_TIMEOUT_MS);
+                    clear_pending_credentials();
                 } else {
-                    /* AUTH_EXPIRE or transient glitch - retry once */
-                    ESP_LOGI(TAG, "Transient disconnect on '%s' - retrying",
+                    ESP_LOGW(TAG, "Connection failed for '%s' - no retry will be attempted",
                              s_target_ssid[0] ? s_target_ssid : "<unknown>");
-                    esp_wifi_connect();
+                    clear_pending_credentials();
                 }
             } else if (s_state == WIFI_MGR_CONNECTED) {
                 /* Runtime drop - reconnect handled by main loop with backoff */
@@ -226,8 +261,22 @@ static void wifi_event_handler(void *arg, esp_event_base_t base,
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *ev = (ip_event_got_ip_t *)event_data;
         snprintf(s_ip, sizeof(s_ip), IPSTR, IP2STR(&ev->ip_info.ip));
+        snprintf(s_gw_ip, sizeof(s_gw_ip), IPSTR, IP2STR(&ev->ip_info.gw));
         ESP_LOGI(TAG, "Connection success for '%s' - IP: %s",
                  s_target_ssid[0] ? s_target_ssid : "<unknown>", s_ip);
+        ESP_LOGI(TAG, "Gateway for '%s' is %s",
+                 s_target_ssid[0] ? s_target_ssid : "<unknown>", s_gw_ip);
+
+        if (s_pending_ssid[0]) {
+            esp_err_t save_ret = nvs_write(s_pending_ssid, s_pending_pass);
+            if (save_ret == ESP_OK) {
+                ESP_LOGI(TAG, "Saved working credentials for '%s'", s_pending_ssid);
+            } else {
+                ESP_LOGW(TAG, "Failed to save working credentials for '%s': %s",
+                         s_pending_ssid, esp_err_to_name(save_ret));
+            }
+            clear_pending_credentials();
+        }
 
         s_state = WIFI_MGR_CONNECTED;
         xEventGroupSetBits(s_eg, BIT_STA_CONNECTED);
@@ -283,23 +332,44 @@ static void start_ap(void) {
  */
 static void connect_sta(const char *ssid, const char *pass, bool open) {
     wifi_config_t sta = {0};
+    const wifi_ap_record_t *scan_ap = find_scanned_ap(ssid);
     strncpy((char *)sta.sta.ssid, ssid, sizeof(sta.sta.ssid) - 1);
     strncpy((char *)sta.sta.password, pass, sizeof(sta.sta.password) - 1);
     strncpy(s_target_ssid, ssid, sizeof(s_target_ssid) - 1);
     s_target_ssid[sizeof(s_target_ssid) - 1] = '\0';
+    strncpy(s_pending_ssid, ssid, sizeof(s_pending_ssid) - 1);
+    s_pending_ssid[sizeof(s_pending_ssid) - 1] = '\0';
+    strncpy(s_pending_pass, pass, sizeof(s_pending_pass) - 1);
+    s_pending_pass[sizeof(s_pending_pass) - 1] = '\0';
 
     if (!open) {
         sta.sta.threshold.authmode = WIFI_AUTH_WPA_PSK;
     }
     /* For open nets, threshold stays at WIFI_AUTH_OPEN (== 0, zero-init) */
+    sta.sta.pmf_cfg.capable = true;
+    sta.sta.pmf_cfg.required = false;
+    if (scan_ap) {
+        sta.sta.channel = scan_ap->primary;
+        sta.sta.bssid_set = 1;
+        memcpy(sta.sta.bssid, scan_ap->bssid, sizeof(sta.sta.bssid));
+    }
 
     s_state         = WIFI_MGR_CONNECTING;
     s_conn_start_us = esp_timer_get_time();
     xEventGroupClearBits(s_eg, BIT_STA_CONNECTED | BIT_STA_FAILED);
 
-    ESP_LOGI(TAG, "Attempting connection to '%s' (%s)",
-             s_target_ssid, open ? "open" : "secured");
+    if (scan_ap) {
+        ESP_LOGI(TAG, "Attempting connection to '%s' (%s) via channel %u bssid %02x:%02x:%02x:%02x:%02x:%02x",
+                 s_target_ssid, open ? "open" : "secured", scan_ap->primary,
+                 scan_ap->bssid[0], scan_ap->bssid[1], scan_ap->bssid[2],
+                 scan_ap->bssid[3], scan_ap->bssid[4], scan_ap->bssid[5]);
+    } else {
+        ESP_LOGI(TAG, "Attempting connection to '%s' (%s) without scan lock",
+                 s_target_ssid, open ? "open" : "secured");
+    }
 
+    /* Reset any partial association from a previous failed attempt. */
+    esp_wifi_disconnect();
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
 
     /*
@@ -408,8 +478,6 @@ esp_err_t wifi_manager_connect(const char *ssid, const char *pass, bool open) {
     }
     ESP_LOGI(TAG, "WiFi selected: '%s'", ssid);
     ESP_LOGI(TAG, "Connect button pressed");
-    /* Write before connecting - survives power cycle mid-handshake */
-    nvs_write(ssid, pass);
     connect_sta(ssid, pass, open);
     return ESP_OK;
 }
@@ -460,6 +528,13 @@ esp_err_t wifi_manager_scan_start(void) {
         .channel     = 0,
         .show_hidden = false,
         .scan_type   = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time   = {
+            .active  = {
+                .min = 20, /* Fast hop so mobile OS doesn't drop captive portal ping */
+                .max = 30
+            }
+        },
+        .home_chan_dwell_time = 30 /* Return to AP channel for 30ms between scans to keep clients alive */
     };
     s_scanning = true;
     s_last_scan_err = ESP_OK;
@@ -492,6 +567,7 @@ void wifi_manager_get_scan_json(char *buf, size_t len) {
 
 wifi_mgr_state_t wifi_manager_get_state(void)  { return s_state;     }
 const char      *wifi_manager_get_ip(void)      { return s_ip;        }
+const char      *wifi_manager_get_gateway_ip(void){ return s_gw_ip;   }
 bool             wifi_manager_ap_active(void)   { return s_ap_active; }
 bool             wifi_manager_scan_running(void){ return s_scanning;  }
 

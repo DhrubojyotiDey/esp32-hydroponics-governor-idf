@@ -11,6 +11,8 @@ body{
   display: flex; align-items: center; justify-content: center;
   min-height: 100vh; padding: 1rem;
   overflow-x: hidden;
+  overscroll-behavior-y: none;
+  touch-action: manipulation;
 }
 .card{
   background: rgba(20, 35, 25, 0.4);
@@ -206,8 +208,9 @@ input:focus, .net-sel.open { border-color: #5dbb63; box-shadow: inset 2px 2px 6p
 </div>
 
 <script>
-var scanStatusTmr,pollTmr,_ip='',_local='';
+var scanStatusTmr,pollTmr,keepAliveTmr,_ip='',_local='';
 var _selSSID='',_selOpen=false,_dropOpen=false;
+var _listTouchStartY=0;
 
 function bars(r){
   if(r>=-50)return'\u2588\u2588\u2588\u2588';
@@ -265,6 +268,35 @@ document.addEventListener('click',function(e){
   var box=document.getElementById('net-sel').parentElement;
   if(_dropOpen&&!box.contains(e.target))closeDropdown();
 });
+function bindListTouchIsolation(){
+  var list=document.getElementById('net-list');
+  if(!list || list._touchIsolated)return;
+  list._touchIsolated=true;
+
+  list.addEventListener('touchstart',function(e){
+    if(e.touches && e.touches.length===1){
+      _listTouchStartY=e.touches[0].clientY;
+    }
+  },{passive:true});
+
+  list.addEventListener('touchmove',function(e){
+    if(!e.touches || e.touches.length!==1)return;
+    var currentY=e.touches[0].clientY;
+    var deltaY=currentY-_listTouchStartY;
+    var atTop=list.scrollTop<=0;
+    var atBottom=list.scrollTop+list.clientHeight>=list.scrollHeight-1;
+
+    if((atTop&&deltaY>0)||(atBottom&&deltaY<0)){
+      e.preventDefault();
+    }
+  },{passive:false});
+}
+function startKeepAlive(){
+  if(keepAliveTmr)return;
+  keepAliveTmr=setInterval(function(){
+    fetch('/keepalive',{cache:'no-store'}).catch(function(){});
+  },4000);
+}
 function selectNet(el){
   _selSSID=el.getAttribute('data-ssid');
   _selOpen=el.getAttribute('data-open')==='true';
@@ -317,6 +349,7 @@ function loadScan(){
         html+='<div class="net-item" data-ssid="'+enc(n.ssid)+'" data-open="'+n.open+'" onclick="selectNet(this)">'+lbl+'</div>';
       });
       list.innerHTML=html;
+      bindListTouchIsolation();
       document.getElementById('net-sel-txt').textContent='-- Select network --';
       setBar('done');
       _dropOpen=true;
@@ -410,5 +443,6 @@ function doCopy(txt){
        document.execCommand('copy');document.body.removeChild(t);}
 }
 doScan();
+startKeepAlive();
 </script>
 </body></html>
