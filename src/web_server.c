@@ -13,6 +13,9 @@
 #include "esp_timer.h"
 #include "esp_ota_ops.h"
 #include "esp_system.h"
+#include "esp_netif.h"
+#include "ping/ping_sock.h"
+#include "lwip/inet.h"
 
 static const char *TAG = "WEB";
 
@@ -27,8 +30,15 @@ static const char *TAG = "WEB";
 static httpd_handle_t s_server    = NULL;
 static bool           s_dash_ready = false;
 static char           s_dash_ip[20] = "";
-static int64_t        s_dash_ready_at_us = 0;  /* set on STA connect */
 static bool           s_ap_shutdown_scheduled = false;
+
+static esp_err_t captive_portal_redirect(httpd_req_t *req) {
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_set_hdr(req, "Location", "http://" AP_IP_ADDR "/");
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
 
 /* ── Async WebSocket send ────────────────────────────────────
  * httpd_ws_send_frame_async() must be called from within the
@@ -87,10 +97,16 @@ void web_server_set_dash_ready(bool ready, const char *ip) {
  * ╚══════════════════════════════════════════════════════════╝ */
 
 static void delayed_ap_shutdown_task(void *arg) {
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(500));
     wifi_manager_ap_shutdown();
     s_ap_shutdown_scheduled = false;
     vTaskDelete(NULL);
+}
+
+static void delayed_reboot_task(void *arg) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    ESP_LOGW(TAG, "Executing user-invoked soft restart to drop AP and enter pure STA mode!");
+    esp_restart();
 }
 
 /* ── GET / — captive portal or dashboard ─────────────────── */
@@ -117,6 +133,14 @@ static esp_err_t root_handler(httpd_req_t *req) {
         const size_t setup_len = page_setup_html_len;
         httpd_resp_send(req, (const char *)page_setup_html_start, setup_len);
     }
+    return ESP_OK;
+}
+
+static esp_err_t reboot_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"rebooting\"}");
+    ESP_LOGI(TAG, "Reboot explicitly requested by Captive Portal UI. Restarting in 1s...");
+    xTaskCreate(delayed_reboot_task, "delayed_reboot", 2048, NULL, 5, NULL);
     return ESP_OK;
 }
 
@@ -159,6 +183,20 @@ static esp_err_t scanstatus_handler(httpd_req_t *req) {
              wifi_manager_scan_running() ? "true" : "false");
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
+    return ESP_OK;
+}
+
+static esp_err_t keepalive_handler(httpd_req_t *req) {
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_sendstr(req, "{\"ok\":true}");
+    return ESP_OK;
+}
+
+static esp_err_t favicon_handler(httpd_req_t *req) {
+    httpd_resp_set_status(req, "204 No Content");
+    httpd_resp_set_hdr(req, "Cache-Control", "max-age=3600");
+    httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
 
@@ -257,11 +295,8 @@ static esp_err_t save_handler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    ESP_LOGI(TAG, "/save — SSID='%s' pass_len=%d open=%d",
-             ssid, (int)strlen(pass), (int)open);
-
-    /* Sensor warmup gate: block /dashready for 4s after connect */
-    s_dash_ready_at_us = esp_timer_get_time() + 4000000LL;
+    ESP_LOGI(TAG, "/save — SSID='%s' | user's given password is %s | open=%d",
+             ssid, pass, (int)open);
 
     esp_err_t ret = wifi_manager_connect(ssid, pass, open);
     httpd_resp_set_type(req, "application/json");
@@ -291,16 +326,30 @@ static esp_err_t status_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
-/* ── GET /dashready — sensor warmup gate ────────────────── */
+/* ── POST /ap_shutdown — shut down AP on demand ─────────── */
+static esp_err_t ap_shutdown_handler(httpd_req_t *req) {
+    if (wifi_manager_ap_active() && !s_ap_shutdown_scheduled) {
+        ESP_LOGI(TAG, "AP shutdown requested via /ap_shutdown endpoint");
+        s_ap_shutdown_scheduled = true;
+        if (xTaskCreate(delayed_ap_shutdown_task, "ap_shutdown",
+                        2048, NULL, 4, NULL) != pdPASS) {
+            s_ap_shutdown_scheduled = false;
+            ESP_LOGW(TAG, "Failed to schedule AP shutdown task");
+        }
+    }
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_sendstr(req, "{\"status\":\"scheduled\"}");
+    return ESP_OK;
+}
+
+/* ── GET /dashready — gateway ping readiness gate ───────── */
 static esp_err_t dashready_handler(httpd_req_t *req) {
-    bool ready = (wifi_manager_get_state() == WIFI_MGR_CONNECTED) &&
-                 (s_dash_ready_at_us > 0) &&
-                 (esp_timer_get_time() >= s_dash_ready_at_us);
+    bool connected = (wifi_manager_get_state() == WIFI_MGR_CONNECTED);
 
     char buf[128];
     snprintf(buf, sizeof(buf),
         "{\"ready\":%s,\"ip\":\"%s\",\"local\":\"http://" MDNS_HOSTNAME ".local\"}",
-        ready ? "true" : "false", wifi_manager_get_ip());
+        connected ? "true" : "false", wifi_manager_get_ip());
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, buf);
@@ -339,7 +388,12 @@ static esp_err_t ws_handler(httpd_req_t *req) {
 
     /* First call with len=0 to get the frame length */
     esp_err_t ret = httpd_ws_recv_frame(req, &pkt, 0);
-    if (ret != ESP_OK || pkt.len == 0 || pkt.len > 32) return ESP_OK;
+    if (ret != ESP_OK) {
+        return ret;
+    }
+    if (pkt.len == 0 || pkt.len > 32) {
+        return ESP_OK;
+    }
 
     uint8_t buf[33] = {0};
     pkt.payload = buf;
@@ -417,32 +471,24 @@ static esp_err_t ota_handler(httpd_req_t *req) {
 
 /* Android: GET /generate_204 → 302 to portal */
 static esp_err_t captive_android_handler(httpd_req_t *req) {
-    httpd_resp_set_status(req, "302 Found");
-    httpd_resp_set_hdr(req, "Location", "http://" AP_IP_ADDR "/");
-    httpd_resp_send(req, NULL, 0);
-    return ESP_OK;
+    return captive_portal_redirect(req);
 }
 
-/* Windows: GET /connecttest.txt → 200 */
+/* Windows: GET /connecttest.txt -> redirect to keep captive portal open */
 static esp_err_t captive_windows_handler(httpd_req_t *req) {
-    httpd_resp_sendstr(req, "Microsoft Connect Test");
-    return ESP_OK;
+    return captive_portal_redirect(req);
 }
 
-/* Apple: GET /hotspot-detect.html → 200 with Success */
+/* Apple: GET /hotspot-detect.html -> redirect to keep captive portal open */
 static esp_err_t captive_apple_handler(httpd_req_t *req) {
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req, "<HTML><BODY>Success</BODY></HTML>");
-    return ESP_OK;
+    return captive_portal_redirect(req);
 }
 
 /* ── 404 / catchall → redirect to portal ─────────────────── */
 static esp_err_t not_found_handler(httpd_req_t *req, httpd_err_code_t err) {
     if (wifi_manager_get_state() != WIFI_MGR_CONNECTED) {
         /* In provisioning mode, all unknown URLs → captive portal */
-        httpd_resp_set_status(req, "302 Found");
-        httpd_resp_set_hdr(req, "Location", "http://" AP_IP_ADDR "/");
-        httpd_resp_send(req, NULL, 0);
+        captive_portal_redirect(req);
     } else {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
     }
@@ -453,7 +499,7 @@ static esp_err_t not_found_handler(httpd_req_t *req, httpd_err_code_t err) {
 
 esp_err_t web_server_start(void) {
     httpd_config_t cfg        = HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers      = 16;
+    cfg.max_uri_handlers      = 24;
     cfg.stack_size            = 8192;
     cfg.lru_purge_enable      = true;  /* drop oldest client on slot exhaustion */
 
@@ -471,14 +517,21 @@ esp_err_t web_server_start(void) {
         { .uri = "/scan",               .method = HTTP_GET,  .handler = scan_handler          },
         { .uri = "/scanresults",        .method = HTTP_GET,  .handler = scanresults_handler   },
         { .uri = "/scanstatus",         .method = HTTP_GET,  .handler = scanstatus_handler    },
+        { .uri = "/keepalive",          .method = HTTP_GET,  .handler = keepalive_handler     },
+        { .uri = "/favicon.ico",        .method = HTTP_GET,  .handler = favicon_handler       },
         { .uri = "/save",               .method = HTTP_POST, .handler = save_handler          },
         { .uri = "/status",             .method = HTTP_GET,  .handler = status_handler        },
+        { .uri = "/ap_shutdown",        .method = HTTP_POST, .handler = ap_shutdown_handler   },
+        { .uri = "/reboot",             .method = HTTP_POST, .handler = reboot_handler        },
         { .uri = "/dashready",          .method = HTTP_GET,  .handler = dashready_handler     },
         { .uri = "/data",               .method = HTTP_GET,  .handler = data_handler          },
         { .uri = "/ota",                .method = HTTP_POST, .handler = ota_handler           },
         { .uri = "/generate_204",       .method = HTTP_GET,  .handler = captive_android_handler},
         { .uri = "/connecttest.txt",    .method = HTTP_GET,  .handler = captive_windows_handler},
+        { .uri = "/fwlink",             .method = HTTP_GET,  .handler = captive_windows_handler},
+        { .uri = "/ncsi.txt",           .method = HTTP_GET,  .handler = captive_windows_handler},
         { .uri = "/hotspot-detect.html",.method = HTTP_GET,  .handler = captive_apple_handler },
+        { .uri = "/success.txt",        .method = HTTP_GET,  .handler = captive_apple_handler },
         { .uri = "/ws",                 .method = HTTP_GET,  .handler = ws_handler,
           .is_websocket = true                                                                 },
     };
