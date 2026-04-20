@@ -97,7 +97,7 @@ void web_server_set_dash_ready(bool ready, const char *ip) {
  * ╚══════════════════════════════════════════════════════════╝ */
 
 static void delayed_ap_shutdown_task(void *arg) {
-    vTaskDelay(pdMS_TO_TICKS(3000));
+    vTaskDelay(pdMS_TO_TICKS(500));
     wifi_manager_ap_shutdown();
     s_ap_shutdown_scheduled = false;
     vTaskDelete(NULL);
