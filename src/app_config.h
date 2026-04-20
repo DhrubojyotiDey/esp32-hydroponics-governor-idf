@@ -23,8 +23,12 @@
 #define NVS_KEY_PASS        "pass"
 
 /* ── WiFi connection timing ─────────────────────────────────*/
-#define WIFI_CONNECT_TIMEOUT_MS    30000  /* hard timeout           */
+#define WIFI_CONNECT_TIMEOUT_MS    8000   /* hard timeout           */
 #define WIFI_RECONNECT_INTERVAL_MS 30000  /* backoff after drop     */
+
+/* Gateway ping readiness check for dashboard availability. */
+#define GATEWAY_PING_TIMEOUT_MS    1000
+#define GATEWAY_PING_COUNT         3
 
 /* ── Sensor health timeouts ─────────────────────────────────
  * Sensor marked DEAD if no reading received within timeout.  */

@@ -68,6 +68,9 @@ wifi_mgr_state_t wifi_manager_get_state(void);
 /** IP address string — only valid when state == WIFI_MGR_CONNECTED. */
 const char *wifi_manager_get_ip(void);
 
+/** Gateway IP string — valid after STA gets an IP. */
+const char *wifi_manager_get_gateway_ip(void);
+
 /** True if the AP interface is currently active. */
 bool wifi_manager_ap_active(void);
 
